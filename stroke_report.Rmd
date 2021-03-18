@@ -1,0 +1,313 @@
+---
+title: "EDX Capstone Stroke Predictions"
+author: "Eduardo Almada"
+date: "18/03/2021"
+output: 
+  pdf_document: 
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+## Installing packages
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(imbalance)) install.packages("imbalance", repos = "http://cran.us.r-project.org")
+if(!require(naniar)) install.packages("naniar", repos = "http://cran.us.r-project.org")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(skimr)) install.packages("skimr", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(MLmetrics)) install.packages("MLmetrics", repos = "http://cran.us.r-project.org")
+if(!require(ranger)) install.packages("ranger", repos = "http://cran.us.r-project.org")
+
+## calling packages
+library(tidyverse) 
+library(naniar) 
+library(skimr) 
+library(caret) 
+library(MLmetrics) 
+library(imbalance) 
+library(gridExtra) 
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+This is a project report for Edx HarvardX: PH125.9 - Data Science: Capstone, in which every student must look for a dataset to analyse and use machine learning to predict an outcome, for this report I chose the **Stroke Prediction Dataset** in which the dataset can be used to predict whether a patient is likely to get a stroke based on the input parameters like gender, age, various diseases, and smoking status. Each row in the data provides relevant information about the patient (id).
+
+# Introduction
+
+According to the [World Health Organization](https://www.who.int) (WHO) stroke is the 2nd leading cause of death globally, responsible for approximately 11% of total deaths. so being able to predict a stroke based on the various inputs can have a greater impact on helping avoiding or containing them.
+
+# Pre-processing the data
+
+In order to start the algorithm we should first prepare the data, so lets review it first:
+
+```{r loading data, echo= T}
+# Load data from a csv within a zip file
+data <- read_csv(unz('archive.zip','healthcare-dataset-stroke-data.csv'))
+
+# data preview
+summary(data)# data summary
+```
+
+Now that we know how the data is arranged, we will proceed by counting if any all the missing values.
+
+```{r NAs, echo= F}
+##Formatting and cleaning the data
+# looking for N/A
+knitr::kable(miss_scan_count(data = data, search = list("N/A", "Unknown")))
+
+```
+
+## Cleaning the data
+
+Two variables are missing data, so before we proceed with the analysis this values should be fix.
+
+```{r replacing NA and unknowns, echo= T}
+# replacing N/A and Unknown with NA
+clean_data <- replace_with_na(data,replace = list(bmi = c('N/A'),
+                            smoking_status = c("Unknown")))
+
+# cleaning and formatting data
+post_data <- clean_data %>% mutate(stroke = factor(stroke), 
+        bmi = ifelse(is.na(bmi),median(bmi,na.rm = T),bmi),
+        hypertension = factor(hypertension),
+        heart_disease = factor(heart_disease)) %>% filter(!gender == 'Other') %>% 
+        select(-id)
+# filling smoking_status Na's with previous values
+post_data <- post_data %>% fill(smoking_status)
+```
+
+## Vizualising the data
+
+Now lets create density plots for data exploration.
+
+```{r init data visuals, echo= F}
+############### plotting for visual analysis ##################
+# numeric variable distribution
+grid.arrange(
+a = post_data %>% 
+  ggplot(aes(as.numeric(bmi), fill = as.factor(stroke))) + geom_density(alpha = 0.2) +
+  xlab('Body mass index') + ggtitle('Numeric Variable distribution'),
+b = post_data %>% 
+  ggplot(aes(avg_glucose_level, fill = stroke)) + geom_density(alpha = 0.2) +
+  xlab('Average glucose level'),
+a = post_data %>% 
+  ggplot(aes(age, fill = stroke)) + geom_density(alpha = 0.2) +
+  xlab('Age')
+)
+```
+After analyzing the plots, it is concluded that the variable *age* is the one that drives the chance of a stroke, this will be useful when approaching the methods for ML.
+
+# Exploring the data
+
+Let us see the proportions of people with stroke records:
+
+```{r stroke record, echo=F}
+# counting people with stroke records
+knitr::kable(post_data %>% group_by(stroke) %>%
+  summarize(n = n()) %>% mutate(prop = round(n / sum(n), 2)))
+```
+ 
+It is evident that the data is imbalance, so if we were to always predict for people not to get a stroke we would have a 95% accuracy, but this is not our goal. Lets see if using maching learning we can improve the Specificity or capability of predicting negative negatives, assuming we set our positive as not having a stroke.
+
+Before we train the data let us change the characters vectors into factors and the body mass index to the categories the [Center of Disease control and Prevention](https://www.cdc.gov/healthyweight/assessing/bmi/adult_bmi/index.html) standardizes according to the bmi of a person. (underweight, normal weight, overweight and obese)
+
+```{r data prep for ML, echo=T}
+# preparing data for ML algorithms
+post_data <- post_data %>%
+  mutate(across(c(hypertension, heart_disease), factor), # changing hypertension & heart_disease class to factor
+         across(where(is.character), as.factor), # changing character class to factors
+         across(where(is.factor), as.numeric), # changing factors to numeric
+         stroke = factor(ifelse(stroke == 1, '0', '1')), # setting stroke factors to 1 for positive and 0 to negative
+        # changing bmi vector from numeric to categorical according to the CDC categories
+        # https://www.cdc.gov/healthyweight/assessing/bmi/adult_bmi/index.html
+         bmi = case_when(bmi < 18.5 ~ 'underweight',
+        bmi >= 18.5 & bmi < 25 ~ 'normal_weight',
+        bmi >= 25 & bmi < 30 ~ 'overweight',
+        bmi >= 30 ~ 'obese'),
+        bmi = factor(bmi, 
+        levels = c("underweight", "normal_weight",
+        "overweight", "obese"), order = TRUE)
+        ) %>% as_tibble()
+head(post_data)
+```
+
+## Training data
+
+```{r Set training and validation set, echo=T}
+########### Set training and validation set #########
+# setting root for repeatability purposes
+set.seed(2021) 
+
+# creating train and test set
+index <-  createDataPartition(post_data$stroke, times = 1, p = 0.3, list = F)
+o_train_set <- post_data[-index,]
+o_test_set <- post_data[index,]
+
+```
+
+```{r print p1, echo=F}
+cat('Dimensions of the train set: ',dim(o_train_set))
+
+cat('Dimensions of the test set: ',dim(o_test_set))
+```
+
+# Methods
+
+In this section, two methods were used to develop the predictions of having a stroke:
+
+## GLM Model
+
+The *generalized linear model* is a generalization of ordinary linear regression that allows for response variables that have error distribution models other than a normal distribution like Gaussian distribution.
+
+```{r glm model, echo= T}
+##################### glm model ####################
+set.seed(2021) # setting root for repeatability purposes
+glm_model <- train(stroke ~ ., method = 'glm', data = o_train_set)
+confusionMatrix(predict(glm_model, o_test_set), o_test_set$stroke)
+```
+
+As we predicted before we do get an accuracy of 95%, and a Specificity of zero, this means that this model is overperforming and should be rejected.
+
+## RF Model
+
+The *Random forest* model consists of a large number of individual decision trees that operate as an ensemble. Each individual tree in the random forest spits out a class prediction and the class with the most votes becomes our model’s prediction 
+
+```{r random forest, echo= T}
+##################### random forest model ####################
+set.seed(2021) # setting root for repeatability purposes
+
+# setting the tune grid
+rfGrid <- data.frame(.mtry = c(2,3,5,6),.splitrule = "gini",
+  .min.node.size = 5)
+
+# setting the control parameters
+rfControl <- trainControl(
+  method = "oob", number = 5,
+  verboseIter = TRUE)
+
+rf_model <- train(stroke ~ ., data = o_train_set,
+  method = "ranger", tuneLength = 3,
+  tuneGrid = rfGrid,trControl = rfControl)
+confusionMatrix(predict(rf_model,o_test_set),o_test_set$stroke)
+```
+
+The method used within the random forest is **Ranger** a fast implementation of random forests or recursive partitioning, particularly suited for high dimensional data. 
+
+The same results from the past method is obtained, this means that due to the imbalance in the strokes column our algorithm will always miss the recall. The next step shoulb be balancing the data.
+
+# Balancing the data
+
+For this we will use the oversample function from the *imbalance* package, which generates data for binary class datasets, so that ML models can perform better in predicting for both positives and negatives.
+
+Data before balancing it:
+
+```{r non balanced data, echo= F}
+# counting people with stroke records
+knitr::kable(post_data %>% group_by(stroke) %>%
+  summarize(n = n()) %>% mutate(prop = round(n / sum(n), 2))) # 5% of imbalance
+```
+
+Data after balancing it:
+
+```{r balancing data, echo= F, include=F}
+#Majority Weighted Minority Oversampling Technique
+post_dataa <- oversample(as.data.frame(post_data), 
+           classAttr = "stroke", ratio = 1, method = "MWMOTE")
+
+
+```
+
+```{r print balance data, echo= F}
+# counting people with stroke records now balanced
+knitr::kable(post_dataa %>% group_by(stroke) %>%
+  summarize(n = n()) %>% mutate(prop = round(n / sum(n), 2)))
+```
+
+Now that the proportions are even, let us try the ML methods again.
+
+## Training data pt. 2
+
+```{r trainig balanced data, echo= T}
+# setting root for repeatability purposes
+set.seed(2021) 
+
+# creating train and test set
+index <-  createDataPartition(post_dataa$stroke, times = 1, p = 0.3, list = F)
+train_set <- post_dataa[-index,]
+test_set <- post_dataa[index,]
+
+
+
+```
+
+```{r print p2, echo=F}
+# dimensioning sets
+cat('Dimensions of the train set: ',dim(train_set))
+
+cat('Dimensions of the test set: ',dim(test_set))
+```
+
+# Methods with balanced data
+
+## GLM Model
+
+```{r glm pt 2, echo= T}
+##################### glm model ####################
+set.seed(2021) # setting root for repeatability purposes
+glm_model <- train(stroke ~ ., method = 'glm', data = train_set)
+confusionMatrix(predict(glm_model, test_set), test_set$stroke)
+```
+The accuracy went up, and the Specificity is no longer zero, now our model can predict stokes with a 95% accuracy.         
+
+## RF Model
+
+```{r RF pt 2, echo= T}
+##################### random forest model ####################
+set.seed(2021) # setting root for repeatability purposes
+
+# setting the tune grid
+rfGrid <- data.frame(.mtry = c(2,3,5,6),.splitrule = "gini",
+                     .min.node.size = 5)
+
+# setting the control parameters
+rfControl <- trainControl(
+  method = "oob", number = 5,
+  verboseIter = TRUE)
+
+rf_model <- train(stroke ~ .,train_set,
+                  method = "ranger",tuneLength = 3,
+                  tuneGrid = rfGrid,trControl = rfControl)
+
+# testing with balanced test set
+confusionMatrix(predict(rf_model,test_set),test_set$stroke)
+```
+
+Same outcome for this model, but can it predict when using the whole dataset?
+
+# Results/Conclusions
+
+The improvement obtained by balancing the data was notorious, but can it preform with the same accuracy when using the complete data?.
+
+Let us check using the random forest model:
+
+```{r results, echo= T}
+# testing with original data
+confusionMatrix(predict(rf_model, post_dataa) ,post_dataa$stroke)
+# Accuracy for the random forest with original data
+F1_Score(post_dataa$stroke,predict(rf_model,post_dataa))
+
+```
+
+In practical terms we get the same accuracy of about 97%, and a high Sensitivity & Specificity ,
+
+# Session info
+
+```{r session info}
+sessionInfo()
+
+```
+
